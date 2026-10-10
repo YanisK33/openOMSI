@@ -938,9 +938,16 @@ impl Micro {
         // them is so short that it comes back as a beat of its own before a wheel cannot be
         // told about it (a hundred times a second, so the 0.1 m grain is let go above 40 Hz,
         // where the 0.9 m one carries the surface on its own).
-        let fine = 1.0 - (v / 0.4 / 40.0).clamp(0.0, 1.0);
-        let shape = ride(self.roll / 6.0) * 0.34 + ride(self.roll / 2.2 + 5.3) * 0.26 + ride(self.roll / 0.9 + 11.9) * 0.4;
-        let surface = grain(self.roll / 0.25) * 0.55 + grain(self.roll / 0.1 + 31.7) * 0.45 * fine;
+        // The game samples this signal once per frame. At 27 FPS, a 25 cm road
+        // texture becomes a 33 Hz signal at only 30 km/h; sending those samples
+        // aliases it into a slow wheel shake. Fade each spatial band before its
+        // frequency reaches the frame's Nyquist limit (with headroom for the
+        // harmonics of the interpolated road and a motor updated at up to 100 Hz).
+        let shape = ride(self.roll / 6.0, v / 6.0, dt) * 0.34
+            + ride(self.roll / 2.2 + 5.3, v / 2.2, dt) * 0.26
+            + ride(self.roll / 0.9 + 11.9, v / 0.9, dt) * 0.4;
+        let surface = grain(self.roll / 0.25) * 0.55 * sample_room(v / 0.25, dt)
+            + grain(self.roll / 0.1 + 31.7) * 0.45 * sample_room(v / 0.1, dt);
         let tarmac = (shape * 0.85 + surface * 0.15) * drive * rough * 0.25 * road;
         // The engine's buzz, each part on the rate it really runs at: the crankshaft
         // turning, the firing pulses above it, and a low rumble under both standing for the
@@ -953,7 +960,7 @@ impl Micro {
         let spin = |p: &mut f32, per_turn: f32| *p = (*p + self.rpm / per_turn * turn).rem_euclid(std::f32::consts::TAU);
         // a wheel is told its force once a frame, so nothing above about 28 Hz can be
         // carried at all and each part is let go over the last stretch before that
-        let room = |f: f32| 1.0 - ((f - 28.0) / 7.0).clamp(0.0, 1.0);
+        let room = |f| sample_room(f, dt);
         spin(&mut self.crank, 60.0);
         spin(&mut self.firing, 30.0);
         spin(&mut self.mass, 240.0);
@@ -975,9 +982,20 @@ impl Micro {
 /// Where `grain` reads the surface, this reads the shape. It is sines whose lengths do not
 /// fit into one another, so it never repeats itself over a stretch of road and never jumps
 /// either. Its sum is 1 at the very most, so it can be mixed by eye.
-fn ride(x: f32) -> f32 {
+fn ride(x: f32, fundamental_hz: f32, dt: f32) -> f32 {
     let t = std::f32::consts::TAU * x;
-    t.sin() * 0.55 + (t * 1.7 + 1.3).sin() * 0.3 + (t * 2.9 + 4.2).sin() * 0.15
+    t.sin() * 0.55 * sample_room(fundamental_hz, dt)
+        + (t * 1.7 + 1.3).sin() * 0.3 * sample_room(fundamental_hz * 1.7, dt)
+        + (t * 2.9 + 4.2).sin() * 0.15 * sample_room(fundamental_hz * 2.9, dt)
+}
+
+/// Fade a vibration band to silence before it reaches the output's Nyquist
+/// frequency. The 0.4 factor keeps room for harmonics and motor update limits.
+fn sample_room(frequency_hz: f32, dt: f32) -> f32 {
+    let max_hz = (0.4 / dt.max(0.001)).min(28.0);
+    let start = max_hz * 0.7;
+    let x = ((frequency_hz - start) / (max_hz - start).max(0.001)).clamp(0.0, 1.0);
+    1.0 - x * x * (3.0 - 2.0 * x)
 }
 
 /// Value noise along one line, -1..1. The grain of a road surface is not a sine wave, and
@@ -1560,10 +1578,15 @@ impl Controllers {
             if let Some(w) = self.wheel.as_mut() {
                 let cfg = find_device_cfg(&self.cfg, &name);
                 let (k_s, k_e) = cfg.and_then(|d| d.ff_scale).unwrap_or((1.0, 1.0));
-                let force = if on { wheel_force(&f, x, x0, &mut self.ff_t, k_s, k_e) } else { 0.0 };
                 let axis_reversed = calibrated_steering_reversed(cfg);
                 let inverted = feedback_inverted(cfg, self.ff_invert, axis_reversed);
-                if !w.set_force(if inverted { -force } else { force }) {
+                let alive = if on {
+                    let force = wheel_force(&f, x, x0, &mut self.ff_t, k_s, k_e);
+                    w.set_force(if inverted { -force } else { force })
+                } else {
+                    w.stop_force()
+                };
+                if !alive {
                     log::warn!("force feedback: {name} went away; looking for it again");
                     self.wheel = None;
                 }
@@ -2656,11 +2679,20 @@ mod button_tests {
         }
     }
     #[test]
+    fn road_vibrations_fade_before_the_frame_rate_can_alias_them() {
+        let at_27_fps = 1.0 / 27.0;
+        let at_60_fps = 1.0 / 60.0;
+        assert!(super::sample_room(6.0, at_27_fps) > 0.9);
+        assert_eq!(super::sample_room(20.0, at_27_fps), 0.0);
+        assert!(super::sample_room(20.0, at_60_fps) > super::sample_room(20.0, at_27_fps));
+    }
+
+    #[test]
     fn the_road_is_under_the_tyres_and_not_merely_slow() {
         // How often the road changes is what the tyre feels, and it has to outrun the
         // hands: the rim goes wherever it is told and the hands go with it, so a change a
         // few times a second is a push to be dragged along by rather than a texture. The
-        // short layer is what keeps this true as the bus speeds up.
+        // resolvable bands still carry the road at speed; bands above the frame rate fade.
         let rate = |v: &[f32]| {
             let mut crossings = 0;
             for i in 1..v.len() {
@@ -2672,7 +2704,7 @@ mod button_tests {
         };
         assert!(rate(&road(30.0)) > 6.0, "the road in town is too slow to feel: {}", rate(&road(30.0)));
         assert!(rate(&road(50.0)) > 10.0, "the road at 50 is too slow to feel: {}", rate(&road(50.0)));
-        assert!(rate(&road(80.0)) > 13.0, "the road does not quicken with the speed: {}", rate(&road(80.0)));
+        assert!(rate(&road(80.0)) > 6.0, "the road has no resolvable texture at speed: {}", rate(&road(80.0)));
     }
 
 
@@ -2690,10 +2722,10 @@ mod button_tests {
         let road = felt(&mut m, 50.0);
         let fast = felt(&mut m, 80.0);
         assert!(crawling > 0.0 && town > crawling * 2.0, "{crawling} {town}");
-        // the finer layer is let go above 40 Hz and the coarser one carries the road
-        // there, so the strength holds from town speed up rather than falling away
+        // Above the output's frame-rate ceiling the texture is attenuated instead of
+        // aliasing; the remaining spatial bands still carry a road feel.
         assert!(road > town * 0.9, "the grain should be at its strongest by 30 km/h: {town} {road}");
-        assert!(fast > road * 0.9, "the grain thins out at speed: {fast} against {road}");
+        assert!(fast > 0.0 && fast < road, "unresolvable high-speed grain was not attenuated: {fast} against {road}");
         assert!(fast < MICRO_MAX, "the grain grows too strong: {fast}");
     }
 
