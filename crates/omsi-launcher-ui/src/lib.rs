@@ -436,8 +436,17 @@ impl ApplicationHandler for Launcher {
         // (the game opens on the screen the launcher stands on, #1959)
         if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::Focused(true)) {
             if let Some(w) = self.window.as_ref() {
-                let (at, size) = (w.outer_position().ok(), w.outer_size());
-                core::instances::set_screen_at(at.map(|p| (p.x + size.width as i32 / 2, p.y + size.height as i32 / 2)));
+                // Wayland does not report a top-level window's position. Its current
+                // monitor is available, though; use the monitor's centre so the game
+                // can select the same display instead of falling back to the primary.
+                let at = w.current_monitor().map(|m| {
+                    let (p, s) = (m.position(), m.size());
+                    (p.x + s.width as i32 / 2, p.y + s.height as i32 / 2)
+                }).or_else(|| {
+                    let (p, s) = (w.outer_position().ok()?, w.outer_size());
+                    Some((p.x + s.width as i32 / 2, p.y + s.height as i32 / 2))
+                });
+                core::instances::set_screen_at(at);
             }
         }
         match event {
